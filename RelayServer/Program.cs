@@ -1055,6 +1055,7 @@ public static class Program
         int minWorkerThreads = Math.Max(16, Environment.ProcessorCount * 4);
         int stallThresholdMs = 1;
         bool sendBufferingEnabled = true;
+        bool xdpEnabled = false;
 
         // poor-man arg parse
         for (int i = 0; i < args.Length; i++)
@@ -1073,6 +1074,7 @@ public static class Program
                 case "--min-worker-threads": minWorkerThreads = int.Parse(args[++i]); break;
                 case "--stall-ms": stallThresholdMs = int.Parse(args[++i]); break;
                 case "--disable-send-buffering": sendBufferingEnabled = false; break;
+                case "--xdp": xdpEnabled = true; break;
             }
         }
 
@@ -1082,8 +1084,8 @@ public static class Program
             .CreateLogger();
             
 
-        Program.EnableDisableSendBuffering(sendBufferingEnabled);
-        Log.Information("[Send Buffering] {send}", sendBufferingEnabled);
+        Program.TweakMsquicSettings(sendBufferingEnabled, xdpEnabled);
+        Log.Information("[Msquic] Send Buffering: {sendBuffering}, XDP: {xdp}", sendBufferingEnabled, xdpEnabled);
 
         // Ensure accept/dispatch have runway under I/O pressure
         ThreadPool.GetMinThreads(out var curWorkers, out var curIO);
@@ -1127,11 +1129,11 @@ public static class Program
         Log.CloseAndFlush();
     }
 
-    private static void EnableDisableSendBuffering(bool SendBufferingEnabled) {
+    private static void TweakMsquicSettings(bool sendBufferingEnabled, bool xdpEnabled) {
         // Reflect all of the types & fields we need from System.Net.Quic
         Assembly quic_assembly = typeof(QuicStream).Assembly;
 
-        Type msQuicApiType = quic_assembly.GetType("System.Net.Quic.MsQuicApi");
+        Type msQuicApiType = quic_assembly.GetType("System.Net.Quic.MsQuicApi", true)!;
         bool isQuicSupported = (bool)msQuicApiType.GetProperty("IsQuicSupported", BindingFlags.NonPublic | BindingFlags.Static).GetValue(null);
 
         if (!isQuicSupported) {
@@ -1139,26 +1141,35 @@ public static class Program
             return; // return early so that we don't segfault later when retreiving the API Table
         }
 
-        Type quic_api_table = quic_assembly.GetType("Microsoft.Quic.QUIC_API_TABLE", true);
+        Type quic_api_table = quic_assembly.GetType("Microsoft.Quic.QUIC_API_TABLE", true)!;
         FieldInfo set_param_api = quic_api_table.GetField("SetParam", BindingFlags.NonPublic | BindingFlags.Instance);
 
-        Type quic_handle = quic_assembly.GetType("Microsoft.Quic.QUIC_HANDLE");
+        Type quic_handle = quic_assembly.GetType("Microsoft.Quic.QUIC_HANDLE", true)!;
 
-        Type quic_settings = quic_assembly.GetType("Microsoft.Quic.QUIC_SETTINGS", true);
+        Type quic_settings = quic_assembly.GetType("Microsoft.Quic.QUIC_SETTINGS", true)!;
         FieldInfo quic_settings_bitfield = quic_settings.GetField("_bitfield", BindingFlags.NonPublic | BindingFlags.Instance);
-        FieldInfo quic_settings_anon = quic_settings.GetField("Anonymous1", BindingFlags.NonPublic | BindingFlags.Instance);
-        FieldInfo anon_is_set_flags = quic_settings_anon.FieldType.GetField("IsSetFlags", BindingFlags.NonPublic | BindingFlags.Instance);
 
+        FieldInfo quic_settings_anon1 = quic_settings.GetField("Anonymous1", BindingFlags.NonPublic | BindingFlags.Instance);
+        FieldInfo anon1_is_set_flags = quic_settings_anon1.FieldType.GetField("IsSetFlags", BindingFlags.NonPublic | BindingFlags.Instance);
+
+        FieldInfo quic_settings_anon2 = quic_settings.GetField("Anonymous2", BindingFlags.NonPublic | BindingFlags.Instance);
+        FieldInfo anon2_flags = quic_settings_anon2.FieldType.GetField("Flags", BindingFlags.NonPublic | BindingFlags.Instance);
+
+        // foreach (FieldInfo field in quic_settings_anon2.FieldType.GetFields())
+        // {
+            
+        // }
 
         // A helper that we're going to reflect, so we don't need to name QUIC_HANDLE or QUIC_SETTINGS
-        static unsafe void SetMsQuicParameterHelper<H, T>(IntPtr del_ptr, IntPtr handle, uint param, T value) {
+        static unsafe void SetMsQuicParameterHelper<H, T>(IntPtr del_ptr, IntPtr handle, uint param, T value) where H : unmanaged where T : unmanaged
+        {
             delegate* unmanaged[Cdecl]<H*, uint, uint, void*, int> del = (delegate* unmanaged[Cdecl]<H*, uint, uint, void*, int>)del_ptr;
             del((H*)handle, param, (uint)sizeof(T), (void*)&value);
         }
 
-        static MethodInfo GetMethodInfo<H, T>(Action<IntPtr, IntPtr, uint, T> action) => action.Method;
+        static MethodInfo GetMethodInfo<H, T>(Action<IntPtr, IntPtr, uint, T> action) where H: unmanaged where T: unmanaged => action.Method;
 
-        MethodInfo set_settings_param_helper = GetMethodInfo<string, string>(SetMsQuicParameterHelper<string, string>)
+        MethodInfo set_settings_param_helper = GetMethodInfo<uint, uint>(SetMsQuicParameterHelper<uint, uint>)
             .GetGenericMethodDefinition()
             .MakeGenericMethod([quic_handle, quic_settings]);
 
@@ -1178,10 +1189,18 @@ public static class Program
 
         object settings = Activator.CreateInstance(quic_settings);
 
-        quic_settings_bitfield.SetValue(settings, (byte)1); // QUIC_SETTINGS.SendBufferingEnabled = 1
-        object anon = quic_settings_anon.GetValue(settings);
-        anon_is_set_flags.SetValue(anon, (ulong)(1 << 24)); // QUIC_SETTINGS.IsSet.SendBufferingEnabled = 1
-        quic_settings_anon.SetValue(settings, anon);
+        // QUIC_SETTINGS.SendBufferingEnabled = sendBufferingEnabled
+        quic_settings_bitfield.SetValue(settings, (byte)(sendBufferingEnabled ? 1 << 0 : 0));
+
+        // QUIC_SETTINGS.XdpEnabled = xdpEnabled
+        object anon2 = quic_settings_anon2.GetValue(settings);
+        anon2_flags.SetValue(anon2, (xdpEnabled ? 1UL : 0UL) << 6);
+        quic_settings_anon2.SetValue(settings, anon2);
+
+        // QUIC_SETTINGS.IsSet.SendBufferingEnabled = 1, .XdpEnabled = 1
+        object anon1 = quic_settings_anon1.GetValue(settings);
+        anon1_is_set_flags.SetValue(anon1, (1UL << 24) | (1UL << 43));
+        quic_settings_anon1.SetValue(settings, anon1);
 
         set_settings_param_helper.Invoke(null, [set_param_del, (IntPtr)0, QUIC_PARAM_GLOBAL_SETTINGS, settings]);
     }
