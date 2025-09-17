@@ -1054,7 +1054,7 @@ public static class Program
         int stallThresholdMs = 1; 
 
         // poor-man arg parse
-        for (int i = 0; i < args.Length - 1; i++)
+        for (int i = 0; i < args.Length; i++)
         {
             switch (args[i])
             {
