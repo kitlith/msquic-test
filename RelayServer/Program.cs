@@ -22,6 +22,8 @@ using Humanizer;
 using Humanizer.Bytes;
 using System.Security.Cryptography;
 
+using System.Reflection;
+
 #region Protocol
 
 public enum MessageType : byte
@@ -1051,7 +1053,8 @@ public static class Program
         int lingerMs = 0; // micro-linger off by default
         string? csvPath = null;
         int minWorkerThreads = Math.Max(16, Environment.ProcessorCount * 4);
-        int stallThresholdMs = 1; 
+        int stallThresholdMs = 1;
+        bool sendBufferingEnabled = true;
 
         // poor-man arg parse
         for (int i = 0; i < args.Length; i++)
@@ -1069,6 +1072,7 @@ public static class Program
                 case "--csv": csvPath = args[++i]; break;
                 case "--min-worker-threads": minWorkerThreads = int.Parse(args[++i]); break;
                 case "--stall-ms": stallThresholdMs = int.Parse(args[++i]); break;
+                case "--disable-send-buffering": sendBufferingEnabled = false; break;
             }
         }
 
@@ -1077,6 +1081,9 @@ public static class Program
             .WriteTo.Async(a => a.Console(outputTemplate: "[{Timestamp:HH:mm:ss.fff} {Level:u3}] {Message:lj}{NewLine}{Exception}"))
             .CreateLogger();
             
+
+        Program.EnableDisableSendBuffering(sendBufferingEnabled);
+        Log.Information("[Send Buffering] {send}", sendBufferingEnabled);
 
         // Ensure accept/dispatch have runway under I/O pressure
         ThreadPool.GetMinThreads(out var curWorkers, out var curIO);
@@ -1118,6 +1125,65 @@ public static class Program
 
         Log.Information("[Main] Shutdown complete");
         Log.CloseAndFlush();
+    }
+
+    private static void EnableDisableSendBuffering(bool SendBufferingEnabled) {
+        // Reflect all of the types & fields we need from System.Net.Quic
+        Assembly quic_assembly = typeof(QuicStream).Assembly;
+
+        Type msQuicApiType = quic_assembly.GetType("System.Net.Quic.MsQuicApi");
+        bool isQuicSupported = (bool)msQuicApiType.GetProperty("IsQuicSupported", BindingFlags.NonPublic | BindingFlags.Static).GetValue(null);
+
+        if (!isQuicSupported) {
+            Log.Information("[Send Buffering] Bailing early due to quic not being supported.");
+            return; // return early so that we don't segfault later when retreiving the API Table
+        }
+
+        Type quic_api_table = quic_assembly.GetType("Microsoft.Quic.QUIC_API_TABLE", true);
+        FieldInfo set_param_api = quic_api_table.GetField("SetParam", BindingFlags.NonPublic | BindingFlags.Instance);
+
+        Type quic_handle = quic_assembly.GetType("Microsoft.Quic.QUIC_HANDLE");
+
+        Type quic_settings = quic_assembly.GetType("Microsoft.Quic.QUIC_SETTINGS", true);
+        FieldInfo quic_settings_bitfield = quic_settings.GetField("_bitfield", BindingFlags.NonPublic | BindingFlags.Instance);
+        FieldInfo quic_settings_anon = quic_settings.GetField("Anonymous1", BindingFlags.NonPublic | BindingFlags.Instance);
+        FieldInfo anon_is_set_flags = quic_settings_anon.FieldType.GetField("IsSetFlags", BindingFlags.NonPublic | BindingFlags.Instance);
+
+
+        // A helper that we're going to reflect, so we don't need to name QUIC_HANDLE or QUIC_SETTINGS
+        static unsafe void SetMsQuicParameterHelper<H, T>(IntPtr del_ptr, IntPtr handle, uint param, T value) {
+            delegate* unmanaged[Cdecl]<H*, uint, uint, void*, int> del = (delegate* unmanaged[Cdecl]<H*, uint, uint, void*, int>)del_ptr;
+            del((H*)handle, param, (uint)sizeof(T), (void*)&value);
+        }
+
+        static MethodInfo GetMethodInfo<H, T>(Action<IntPtr, IntPtr, uint, T> action) => action.Method;
+
+        MethodInfo set_settings_param_helper = GetMethodInfo<string, string>(SetMsQuicParameterHelper<string, string>)
+            .GetGenericMethodDefinition()
+            .MakeGenericMethod([quic_handle, quic_settings]);
+
+
+        // obtain the SetParam api pointer
+        object msQuicApiInstance = msQuicApiType.GetProperty("Api", BindingFlags.NonPublic | BindingFlags.Static).GetGetMethod(true).Invoke(null, Array.Empty<object?>());
+        object apiTablePtr = msQuicApiType.GetProperty("ApiTable").GetGetMethod().Invoke(msQuicApiInstance, Array.Empty<object?>());
+        object apiTable;
+        unsafe
+        {
+            apiTable = Marshal.PtrToStructure((IntPtr)Pointer.Unbox(apiTablePtr), quic_api_table);
+        }
+        IntPtr set_param_del = (IntPtr)set_param_api.GetValue(apiTable);
+
+
+        uint QUIC_PARAM_GLOBAL_SETTINGS = 5;
+
+        object settings = Activator.CreateInstance(quic_settings);
+
+        quic_settings_bitfield.SetValue(settings, (byte)1); // QUIC_SETTINGS.SendBufferingEnabled = 1
+        object anon = quic_settings_anon.GetValue(settings);
+        anon_is_set_flags.SetValue(anon, (ulong)(1 << 24)); // QUIC_SETTINGS.IsSet.SendBufferingEnabled = 1
+        quic_settings_anon.SetValue(settings, anon);
+
+        set_settings_param_helper.Invoke(null, [set_param_del, (IntPtr)0, QUIC_PARAM_GLOBAL_SETTINGS, settings]);
     }
 }
 
