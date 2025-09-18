@@ -1085,7 +1085,7 @@ public static class Program
             
 
         Program.TweakMsquicSettings(sendBufferingEnabled, xdpEnabled);
-        Log.Information("[Msquic] Send Buffering: {sendBuffering}, XDP: {xdp}", sendBufferingEnabled, xdpEnabled);
+        Log.Information("[TweakQuic] Send Buffering: {sendBuffering}, XDP: {xdp}", sendBufferingEnabled, xdpEnabled);
 
         // Ensure accept/dispatch have runway under I/O pressure
         ThreadPool.GetMinThreads(out var curWorkers, out var curIO);
@@ -1129,15 +1129,17 @@ public static class Program
         Log.CloseAndFlush();
     }
 
-    private static void TweakMsquicSettings(bool sendBufferingEnabled, bool xdpEnabled) {
+    private static void TweakMsquicSettings(bool sendBufferingEnabled, bool xdpEnabled)
+    {
         // Reflect all of the types & fields we need from System.Net.Quic
         Assembly quic_assembly = typeof(QuicStream).Assembly;
 
         Type msQuicApiType = quic_assembly.GetType("System.Net.Quic.MsQuicApi", true)!;
         bool isQuicSupported = (bool)msQuicApiType.GetProperty("IsQuicSupported", BindingFlags.NonPublic | BindingFlags.Static).GetValue(null);
 
-        if (!isQuicSupported) {
-            Log.Information("[Send Buffering] Bailing early due to quic not being supported.");
+        if (!isQuicSupported)
+        {
+            Log.Information("[TweakQuic] Bailing early due to quic not being supported.");
             return; // return early so that we don't segfault later when retreiving the API Table
         }
 
@@ -1157,17 +1159,17 @@ public static class Program
 
         // foreach (FieldInfo field in quic_settings_anon2.FieldType.GetFields())
         // {
-            
+
         // }
 
         // A helper that we're going to reflect, so we don't need to name QUIC_HANDLE or QUIC_SETTINGS
-        static unsafe void SetMsQuicParameterHelper<H, T>(IntPtr del_ptr, IntPtr handle, uint param, T value) where H : unmanaged where T : unmanaged
+        static unsafe int SetMsQuicParameterHelper<H, T>(IntPtr del_ptr, IntPtr handle, uint param, T value) where H : unmanaged where T : unmanaged
         {
             delegate* unmanaged[Cdecl]<H*, uint, uint, void*, int> del = (delegate* unmanaged[Cdecl]<H*, uint, uint, void*, int>)del_ptr;
-            del((H*)handle, param, (uint)sizeof(T), (void*)&value);
+            return del((H*)handle, param, (uint)sizeof(T), (void*)&value);
         }
 
-        static MethodInfo GetMethodInfo<H, T>(Action<IntPtr, IntPtr, uint, T> action) where H: unmanaged where T: unmanaged => action.Method;
+        static MethodInfo GetMethodInfo<H, T>(Func<IntPtr, IntPtr, uint, T, int> action) where H : unmanaged where T : unmanaged => action.Method;
 
         MethodInfo set_settings_param_helper = GetMethodInfo<uint, uint>(SetMsQuicParameterHelper<uint, uint>)
             .GetGenericMethodDefinition()
@@ -1185,7 +1187,7 @@ public static class Program
         IntPtr set_param_del = (IntPtr)set_param_api.GetValue(apiTable);
 
 
-        uint QUIC_PARAM_GLOBAL_SETTINGS = 5;
+        uint QUIC_PARAM_GLOBAL_SETTINGS = 0x01000005;
 
         object settings = Activator.CreateInstance(quic_settings);
 
@@ -1202,7 +1204,9 @@ public static class Program
         anon1_is_set_flags.SetValue(anon1, (1UL << 24) | (1UL << 43));
         quic_settings_anon1.SetValue(settings, anon1);
 
-        set_settings_param_helper.Invoke(null, [set_param_del, (IntPtr)0, QUIC_PARAM_GLOBAL_SETTINGS, settings]);
+        int result = (int)set_settings_param_helper.Invoke(null, [set_param_del, (IntPtr)0, QUIC_PARAM_GLOBAL_SETTINGS, settings]);
+
+        Log.Information("[TweakQuic] result code: {result}", result);
     }
 }
 
