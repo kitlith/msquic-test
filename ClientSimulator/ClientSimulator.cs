@@ -153,7 +153,7 @@ public sealed class GameTestClient : IDisposable
         _rng = new Random(unchecked(Environment.TickCount * 397) ^ clientId);
     }
 
-    public async Task ConnectAsync(IPEndPoint serverEndPoint)
+    public async Task ConnectAsync(IPEndPoint serverEndPoint, IPEndPoint? clientEndPoint)
     {
         try
         {
@@ -162,6 +162,7 @@ public sealed class GameTestClient : IDisposable
                 DefaultStreamErrorCode = 0x0A,
                 DefaultCloseErrorCode = 0x0B,
                 RemoteEndPoint = serverEndPoint,
+                LocalEndPoint = clientEndPoint,
                 MaxInboundUnidirectionalStreams = 100,
                 MaxInboundBidirectionalStreams = 10,
                 ClientAuthenticationOptions = new SslClientAuthenticationOptions
@@ -521,17 +522,19 @@ public static class Program
         var broadcastCountOption = new Option<int>("--broadcast-count", () => 200, "Requested fanout per message");
         var jitterOption = new Option<double>("--rate-jitter", () => 0.2, "Fractional jitter [0..0.9]");
         var fileLogsOption = new Option<bool>("--file-logs", () => false, "Also log to disk");
+        var clientIpOption = new Option<string?>("--client-ip", () => null, "Client IP");
 
         var root = new RootCommand("QUIC Game Client Load Tester")
         {
             serverOption, portOption, clientsOption, durationOption, aggIntervalOption, rampMsOption,
             movementRateOption, chatRateOption, gameEventRateOption, pingRateOption, payloadSizeOption,
-            broadcastCountOption, jitterOption, fileLogsOption
+            broadcastCountOption, jitterOption, fileLogsOption, clientIpOption
         };
 
         root.SetHandler(async (InvocationContext ctx) =>
         {
             var server = ctx.ParseResult.GetValueForOption(serverOption) ?? "127.0.0.1";
+            var clientIp = ctx.ParseResult.GetValueForOption(clientIpOption);
             var port = ctx.ParseResult.GetValueForOption(portOption);
             var clients = ctx.ParseResult.GetValueForOption(clientsOption);
             var aggInterval = ctx.ParseResult.GetValueForOption(aggIntervalOption);
@@ -584,6 +587,13 @@ public static class Program
                 ipAddress = addrs.First(a => a.AddressFamily == AddressFamily.InterNetwork);
             }
             var serverEndPoint = new IPEndPoint(ipAddress, port);
+            IPEndPoint? clientEndpoint = null;
+
+            if (clientIp is not null)
+            {
+                clientEndpoint = IPEndPoint.Parse(clientIp);
+                Log.Information("Client Endpoint: {endpoint}", clientEndpoint);
+            }
 
             Log.Information("Starting {ClientCount} clients to {Server}:{Port} for {Duration}s (broadcast={Broadcast}, jitter={Jitter:P0}, agg={Agg}s)",
                 clients, server, port, duration, broadcastCount, jitter, aggInterval);
@@ -608,7 +618,7 @@ public static class Program
                     var client = new GameTestClient(clientLogger, messageConfigs, clientId, broadcastCount, jitter);
                     testClients.Add(client);
 
-                    connectTasks.Add(client.ConnectAsync(serverEndPoint));
+                    connectTasks.Add(client.ConnectAsync(serverEndPoint, clientEndpoint));
 
                     if (rampMs > 0 && i < clients - 1)
                         await Task.Delay(rampMs);
